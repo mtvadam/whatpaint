@@ -5,6 +5,10 @@
   "main": "index.js",
   "scripts": {
     "dev": "next dev",
+    "build:colors": "npx tsx scripts/build-color-db.ts",
+    "build:zips": "npx tsx scripts/build-zip-db.ts",
+    "build:data": "npm run build:colors && npm run build:zips",
+    "prebuild": "npm run build:data",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
@@ -17,11 +21,16 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "autoprefixer": "^10.4.27",
+    "colornerd": "^2.4.11",
     "next": "^16.1.6",
     "postcss": "^8.5.6",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
+    "sherwin-williams": "^1.0.4",
     "tailwindcss": "^3.4.19",
     "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
   }
 }

@@ -1,3 +1,5 @@
+import zipData from '@/data/generated-zipcodes.json';
+
 export type LocationResult = {
   latitude: number;
   longitude: number;
@@ -6,67 +8,112 @@ export type LocationResult = {
   zipCode?: string;
 };
 
+type ZipEntry = {
+  zip: string;
+  lat: number;
+  lng: number;
+  city: string;
+  state: string;
+};
+
+const zipDatabase = zipData as ZipEntry[];
+
 /**
- * Request browser geolocation permission and get coordinates
+ * Request browser geolocation
  */
 export async function getBrowserLocation(): Promise<LocationResult> {
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) {
-      reject(new Error('Geolocation is not supported by this browser'));
+      reject(new Error('Geolocation is not supported'));
       return;
     }
-
     navigator.geolocation.getCurrentPosition(
-      (position) => {
-        resolve({
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-        });
+      (pos) => {
+        const result: LocationResult = {
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+        };
+        // Reverse geocode from bundled zip data (find nearest zip)
+        const nearest = findNearestZip(pos.coords.latitude, pos.coords.longitude);
+        if (nearest) {
+          result.city = nearest.city;
+          result.state = nearest.state;
+          result.zipCode = nearest.zip;
+        }
+        resolve(result);
       },
-      (error) => {
-        reject(error);
-      },
-      {
-        enableHighAccuracy: true,
-        timeout: 10000,
-        maximumAge: 0,
-      }
+      (err) => reject(err),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
   });
 }
 
 /**
- * Mock location lookup from zip code
- * In production, this would call a geocoding API
+ * Look up location from zip code — uses bundled open-source data, no API key
  */
 export async function getLocationFromZipCode(zipCode: string): Promise<LocationResult> {
-  // Mock implementation - would use real geocoding API in production
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      resolve({
-        latitude: 0,
-        longitude: 0,
-        zipCode,
-        city: 'City Name',
-        state: 'ST',
-      });
-    }, 500);
-  });
+  const cleaned = zipCode.trim().replace(/\D/g, '').slice(0, 5);
+  const entry = zipDatabase.find(z => z.zip === cleaned);
+
+  if (entry) {
+    return {
+      latitude: entry.lat,
+      longitude: entry.lng,
+      city: entry.city,
+      state: entry.state,
+      zipCode: entry.zip,
+    };
+  }
+
+  // If exact zip not in our database, try to find closest zip prefix
+  const prefix = cleaned.slice(0, 3);
+  const nearby = zipDatabase.find(z => z.zip.startsWith(prefix));
+  if (nearby) {
+    return {
+      latitude: nearby.lat,
+      longitude: nearby.lng,
+      city: nearby.city,
+      state: nearby.state,
+      zipCode: cleaned,
+    };
+  }
+
+  // Fallback
+  return {
+    latitude: 0,
+    longitude: 0,
+    city: 'Unknown',
+    state: '',
+    zipCode: cleaned,
+  };
 }
 
 /**
- * Mock reverse geocoding
- * In production, this would call a reverse geocoding API
+ * Find nearest zip code entry to given coordinates
  */
-export async function reverseGeocode(lat: number, lng: number): Promise<Partial<LocationResult>> {
-  // Mock implementation - would use real reverse geocoding API in production
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      resolve({
-        city: 'Your City',
-        state: 'ST',
-        zipCode: '12345',
-      });
-    }, 500);
-  });
+function findNearestZip(lat: number, lng: number): ZipEntry | null {
+  if (zipDatabase.length === 0) return null;
+
+  let nearest = zipDatabase[0];
+  let minDist = haversine(lat, lng, nearest.lat, nearest.lng);
+
+  for (const z of zipDatabase) {
+    const d = haversine(lat, lng, z.lat, z.lng);
+    if (d < minDist) {
+      minDist = d;
+      nearest = z;
+    }
+  }
+
+  return nearest;
+}
+
+function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 3959; // miles
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }

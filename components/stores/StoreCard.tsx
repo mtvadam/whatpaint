@@ -1,4 +1,5 @@
 import type { PaintStore } from '@/types';
+import { getStoreLogo } from '@/components/ui/StoreLogos';
 
 type StoreCardProps = {
   store: PaintStore;
@@ -24,7 +25,7 @@ export function StoreCard({ store, selected, onToggle }: StoreCardProps) {
 
       <div className="flex items-start justify-between">
         <div className="flex items-center space-x-3">
-          <div className="text-4xl">{store.logo}</div>
+          <div className="flex-shrink-0">{getStoreLogo(store.id, 44)}</div>
           <div>
             <h3 className="text-lg font-semibold text-white">{store.name}</h3>
             <p className="text-sm text-gray-400 mt-1">
