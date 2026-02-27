@@ -34,6 +34,8 @@ export type PaintStore = {
 
 export type WhiteBalanceMode = 'none' | 'daylight' | 'tungsten' | 'fluorescent';
 
+export type SegmentationMode = 'off' | 'loading' | 'active' | 'error';
+
 export type SamplePoint = {
   x: number;
   y: number;

@@ -5,6 +5,11 @@ import { Button } from '@/components/ui/Button';
 import { sampleColorGrid, applyWhiteBalance } from '@/lib/sampling';
 import { rgbToHex, findClosestColors } from '@/lib/color-science';
 import { colorDatabase } from '@/data/color-database';
+import { useImageSegmenter } from '@/hooks/useImageSegmenter';
+import { extractRegions, getCategoryAtPoint, sampleRegionColor } from '@/lib/segmentation';
+import { drawAiOverlay } from '@/lib/contour-drawing';
+import type { SegmentRegion } from '@/lib/segmentation';
+import type { SegmentationResult } from '@/hooks/useImageSegmenter';
 import type { RGB, WhiteBalanceMode } from '@/types';
 import type { ColorMatchResult } from '@/lib/color-science';
 import { WhiteBalanceControl } from './WhiteBalanceControl';
@@ -21,12 +26,27 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
   const lastMatchTimeRef = useRef<number>(0);
   const lastMatchedRgbRef = useRef<RGB | null>(null);
 
+  // Segmentation refs (accessed inside rAF loop to avoid stale closures)
+  const lastSegmentationRef = useRef<SegmentationResult | null>(null);
+  const lastSegmentTimeRef = useRef<number>(0);
+  const regionsRef = useRef<SegmentRegion[]>([]);
+  const selectedCategoryIdRef = useRef<number | null>(null);
+
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [whiteBalance, setWhiteBalance] = useState<WhiteBalanceMode>('none');
   const [error, setError] = useState('');
   const [liveColor, setLiveColor] = useState<RGB | null>(null);
   const [liveMatches, setLiveMatches] = useState<ColorMatchResult[]>([]);
   const [isReady, setIsReady] = useState(false);
+  const [aiEnabled, setAiEnabled] = useState(true);
+  const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
+
+  const { isLoading: aiLoading, isReady: aiReady, initSegmenter, segmentFrame } = useImageSegmenter();
+
+  // Sync selectedCategoryId state to ref for rAF loop access
+  useEffect(() => {
+    selectedCategoryIdRef.current = selectedCategoryId;
+  }, [selectedCategoryId]);
 
   const startCamera = useCallback(async () => {
     try {
@@ -76,6 +96,13 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
     };
   }, [stream]);
 
+  // Initialize AI model when camera is ready
+  useEffect(() => {
+    if (isReady && aiEnabled) {
+      initSegmenter();
+    }
+  }, [isReady, aiEnabled, initSegmenter]);
+
   // Main sampling + overlay loop
   useEffect(() => {
     if (!isReady || !videoRef.current) return;
@@ -91,6 +118,7 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
 
     let lastSampleTime = 0;
     const sampleInterval = 120; // ~8fps sampling
+    const segmentInterval = 200; // ~5fps segmentation
     const matchInterval = 400; // run match every 400ms
 
     const loop = (timestamp: number) => {
@@ -113,15 +141,66 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
       samplingCtx.drawImage(video, 0, 0, vw, vh);
       const imageData = samplingCtx.getImageData(0, 0, vw, vh);
 
-      // Sample from center of frame
-      const cx = Math.floor(vw / 2);
-      const cy = Math.floor(vh / 2);
-      let sampled = sampleColorGrid(imageData, cx, cy, 20);
+      // === SEGMENTATION (throttled to ~5fps) ===
+      let currentMask = lastSegmentationRef.current;
+      if (aiReady && aiEnabled && timestamp - lastSegmentTimeRef.current > segmentInterval) {
+        const newMask = segmentFrame(video, timestamp);
+        if (newMask) {
+          currentMask = newMask;
+          lastSegmentationRef.current = newMask;
+          lastSegmentTimeRef.current = timestamp;
+
+          // Extract regions from new mask
+          const regions = extractRegions(
+            newMask.categoryMask,
+            newMask.width,
+            newMask.height
+          );
+          regionsRef.current = regions;
+
+          // Auto-select: if no region is selected, pick the one at center
+          if (selectedCategoryIdRef.current === null && regions.length > 0) {
+            const centerCat = getCategoryAtPoint(
+              newMask.categoryMask,
+              newMask.width,
+              newMask.height,
+              Math.floor(newMask.width / 2),
+              Math.floor(newMask.height / 2)
+            );
+            setSelectedCategoryId(centerCat);
+          }
+        }
+      }
+
+      // === COLOR SAMPLING ===
+      let sampled: RGB;
+      const selCat = selectedCategoryIdRef.current;
+      if (currentMask && selCat !== null && aiEnabled) {
+        // AI mode: sample from the selected region
+        sampled = sampleRegionColor(
+          imageData,
+          currentMask.categoryMask,
+          currentMask.width,
+          currentMask.height,
+          selCat
+        );
+        // Fallback if region returned black (no pixels found)
+        if (sampled[0] === 0 && sampled[1] === 0 && sampled[2] === 0) {
+          const cx = Math.floor(vw / 2);
+          const cy = Math.floor(vh / 2);
+          sampled = sampleColorGrid(imageData, cx, cy, 20);
+        }
+      } else {
+        // Fallback: existing center-point sampling
+        const cx = Math.floor(vw / 2);
+        const cy = Math.floor(vh / 2);
+        sampled = sampleColorGrid(imageData, cx, cy, 20);
+      }
       sampled = applyWhiteBalance(sampled, whiteBalance);
 
       setLiveColor(sampled);
 
-      // Run color matching at a lower rate and only if color changed enough
+      // === COLOR MATCHING (throttled) ===
       const now = Date.now();
       if (now - lastMatchTimeRef.current > matchInterval) {
         const prev = lastMatchedRgbRef.current;
@@ -138,8 +217,17 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
         }
       }
 
-      // Draw targeting overlay
-      drawOverlay(overlayCtx, overlay.width, overlay.height, sampled);
+      // === DRAW OVERLAY ===
+      if (currentMask && regionsRef.current.length > 0 && aiEnabled) {
+        drawAiOverlay(
+          overlayCtx, overlay.width, overlay.height, sampled,
+          regionsRef.current, currentMask.categoryMask,
+          currentMask.width, currentMask.height,
+          selectedCategoryIdRef.current
+        );
+      } else {
+        drawOverlay(overlayCtx, overlay.width, overlay.height, sampled);
+      }
     };
 
     // Size overlay to match displayed size
@@ -160,7 +248,7 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
       cancelAnimationFrame(rafRef.current);
       resizeObserver.disconnect();
     };
-  }, [isReady, whiteBalance]);
+  }, [isReady, whiteBalance, aiReady, aiEnabled, segmentFrame]);
 
   const drawOverlay = (ctx: CanvasRenderingContext2D, w: number, h: number, color: RGB) => {
     ctx.clearRect(0, 0, w, h);
@@ -225,6 +313,33 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
     ctx.stroke();
   };
 
+  // Tap-to-select handler
+  const handleOverlayTap = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const mask = lastSegmentationRef.current;
+    if (!mask || !aiEnabled) return;
+
+    const canvas = overlayCanvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const tapX = Math.floor(
+      ((e.clientX - rect.left) / rect.width) * mask.width
+    );
+    const tapY = Math.floor(
+      ((e.clientY - rect.top) / rect.height) * mask.height
+    );
+
+    const categoryId = getCategoryAtPoint(
+      mask.categoryMask,
+      mask.width,
+      mask.height,
+      tapX,
+      tapY
+    );
+
+    setSelectedCategoryId(categoryId);
+  }, [aiEnabled]);
+
   const handleCapture = () => {
     if (liveColor) {
       onColorDetected(liveColor);
@@ -261,10 +376,12 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
             {/* Hidden sampling canvas (never displayed) */}
             <canvas ref={samplingCanvasRef} className="hidden" />
 
-            {/* Targeting overlay canvas */}
+            {/* Targeting overlay canvas - supports tap when AI is active */}
             <canvas
               ref={overlayCanvasRef}
-              className="absolute inset-0 w-full h-full pointer-events-none"
+              className={`absolute inset-0 w-full h-full ${aiReady && aiEnabled ? '' : 'pointer-events-none'}`}
+              style={aiReady && aiEnabled ? { touchAction: 'none' } : undefined}
+              onClick={handleOverlayTap}
             />
 
             {/* Live color preview - bottom left */}
@@ -309,8 +426,16 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
             {/* Scanning indicator - top */}
             {isReady && (
               <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black/60 backdrop-blur-sm px-4 py-2 rounded-full flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                <span className="text-xs text-white/80 font-medium">Live Detection</span>
+                <div className={`w-2 h-2 rounded-full ${
+                  aiReady && aiEnabled ? 'bg-blue-500' :
+                  aiLoading && aiEnabled ? 'bg-amber-500' :
+                  'bg-green-500'
+                } animate-pulse`} />
+                <span className="text-xs text-white/80 font-medium">
+                  {aiLoading && aiEnabled ? 'Loading AI...' :
+                   aiReady && aiEnabled ? 'AI Detection' :
+                   'Live Detection'}
+                </span>
               </div>
             )}
           </div>
@@ -331,6 +456,36 @@ export function CameraCapture({ onColorDetected }: CameraCaptureProps) {
         value={whiteBalance}
         onChange={setWhiteBalance}
       />
+
+      {/* AI Surface Detection toggle */}
+      <div className="bg-card rounded-xl border border-border p-4 flex items-center justify-between">
+        <div>
+          <div className="text-sm font-medium text-white">AI Surface Detection</div>
+          <div className="text-xs text-gray-500">
+            {aiReady && aiEnabled ? 'Tap regions to select' :
+             aiLoading && aiEnabled ? 'Loading model...' :
+             'Disabled'}
+          </div>
+        </div>
+        <button
+          onClick={() => {
+            setAiEnabled(!aiEnabled);
+            if (aiEnabled) {
+              // Turning off - reset segmentation state
+              lastSegmentationRef.current = null;
+              regionsRef.current = [];
+              setSelectedCategoryId(null);
+            }
+          }}
+          className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+            aiEnabled
+              ? 'bg-accent text-white'
+              : 'bg-background text-gray-400 border border-border'
+          }`}
+        >
+          {aiEnabled ? 'On' : 'Off'}
+        </button>
+      </div>
 
       {/* Live match cards preview */}
       {liveMatches.length > 0 && (
